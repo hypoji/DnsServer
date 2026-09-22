@@ -1,0 +1,16 @@
+[Unit]
+Description=Technitium DNS Server Socket (DNS-over-TLS)
+
+# Install as 'dns-tls.socket' next to 'dns.service'; see build.md for setup steps.
+
+[Socket]
+ListenStream=0.0.0.0:853
+ListenStream=[::]:853
+BindIPv6Only=ipv6-only
+FileDescriptorName=dns-tls
+Service=dns.service
+ReceiveBuffer=2M
+SendBuffer=2M
+
+[Install]
+WantedBy=sockets.target

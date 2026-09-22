@@ -76,6 +76,60 @@ sudo rm /etc/resolv.conf
 echo "nameserver 127.0.0.1" | sudo tee /etc/resolv.conf
 ```
 
+Optionally, let systemd own the port 53 (and, for DNS-over-TLS, port 853) sockets (socket
+activation) and hand them to the DNS server. This is what allows the server to see the real
+client IP when it runs inside a rootless container, and lets it start on the first query.
+Install the socket unit as `dns.socket` so that systemd pairs it with `dns.service`:
+
+```
+sudo cp /opt/technitium/dns/systemd.socket /etc/systemd/system/dns.socket
+sudo systemctl enable --now dns.socket
+```
+
+With the socket active the server no longer binds port 53 itself, so `CAP_NET_BIND_SERVICE`
+is not required on the service unit (unless another port that the server still self-binds
+needs it).
+
+To also cover DNS-over-TLS, install `systemd-dns-tls.socket` as `dns-tls.socket`. Its unit
+name does not match `dns.service`, so systemd will not pair them automatically; the unit
+already carries `Service=dns.service` to say which service it belongs to (edit that line
+first if your service unit is named differently), and `dns.service` needs a matching
+`Sockets=` line added to it:
+
+```
+sudo cp /opt/technitium/dns/systemd-dns-tls.socket /etc/systemd/system/dns-tls.socket
+sudo systemctl edit dns.service
+```
+
+In the editor that opens, add:
+
+```
+[Service]
+Sockets=dns.socket dns-tls.socket
+```
+
+(list only `dns-tls.socket` there if `dns.socket` is not installed), then run:
+
+```
+sudo systemctl daemon-reload
+sudo systemctl enable --now dns-tls.socket
+sudo systemctl restart dns.service
+```
+
+Without both of these, `dns-tls.socket` fails to start with
+`Socket service dns-tls.service not loaded, refusing.`
+
+The port in the socket unit must match the DNS-over-TLS port configured in the DNS server
+settings (853 by default) - changing the port in the settings alone does not move the
+socket. Do not use this if DNS-over-TLS is served through a reverse proxy or load balancer
+(a shared 853 listener that only passes the TCP connection through): the socket unit would
+fail to bind because the proxy already owns the port, and even if it didn't, connections
+would still appear to come from the proxy rather than the real client. Use the DNS server's
+reverse proxy network ACL and `X-Real-IP` header support for that case instead.
+
+DNS-over-HTTPS, DNS-over-QUIC and HTTP/3 are not covered by socket activation and keep
+binding their own ports as configured in the DNS server settings.
+
 8. Build and run docker image.
 
 Note! Skip this step if you have already installed the DNS server as a systemd service in previous step.

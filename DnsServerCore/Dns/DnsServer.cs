@@ -135,6 +135,11 @@ namespace DnsServerCore.Dns
         readonly List<Socket> _tcpProxyListeners = new List<Socket>();
         readonly List<Socket> _tlsListeners = new List<Socket>();
         readonly List<QuicListener> _quicListeners = new List<QuicListener>();
+        readonly HashSet<Socket> _systemdListeners = new HashSet<Socket>(); //listeners handed over by systemd socket activation, kept across in-process restarts
+        bool _systemdListenersStarted;
+        readonly List<IPEndPoint> _systemdDo53UdpEndPoints = new List<IPEndPoint>(); //endpoints bound via systemd socket activation
+        readonly List<IPEndPoint> _systemdDo53TcpEndPoints = new List<IPEndPoint>();
+        readonly List<IPEndPoint> _systemdDoTEndPoints = new List<IPEndPoint>();
 
         WebApplication _dohWebService;
 
@@ -394,6 +399,20 @@ namespace DnsServerCore.Dns
                 return;
 
             await StopAsync();
+
+            foreach (Socket socket in _systemdListeners)
+            {
+                try
+                {
+                    socket.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    _log.Write(ex);
+                }
+            }
+
+            _systemdListeners.Clear();
 
             StopTlsCertificateUpdateTimer();
 
@@ -1739,6 +1758,186 @@ namespace DnsServerCore.Dns
             return null;
         }
 
+        private void SetupSystemdListeners()
+        {
+            if ((Environment.OSVersion.Platform != PlatformID.Unix) || !SystemdSocketActivation.IsActivated)
+                return;
+
+            if (_systemdListenersStarted)
+            {
+                //already set up; just refresh the UDP buffer sizes in case they changed
+                foreach (Socket socket in _systemdListeners)
+                {
+                    if (socket.SocketType == SocketType.Dgram)
+                        TryApplyUdpBufferSizes(socket);
+                }
+
+                return;
+            }
+
+            _systemdListenersStarted = true;
+
+            foreach (string name in SystemdSocketActivation.GetActivatedNames())
+            {
+                switch (name)
+                {
+                    case SystemdSocketActivation.NAME_DNS:
+                    case SystemdSocketActivation.NAME_DNS_TLS:
+                        break;
+
+                    case SystemdSocketActivation.NAME_DNS_HTTPS:
+                        _log.Write("DNS Server received a systemd activated socket named '" + name + "' but DNS-over-HTTPS does not support socket activation yet; the socket was not used.");
+                        SystemdSocketActivation.DisposeListenerSockets(name);
+                        break;
+
+                    default:
+                        _log.Write("DNS Server received a systemd activated socket with an unrecognized descriptor name '" + name + "'; the socket was not used. Set FileDescriptorName= to '" + SystemdSocketActivation.NAME_DNS + "' (Do53) or '" + SystemdSocketActivation.NAME_DNS_TLS + "' (DNS-over-TLS) in the socket unit.");
+                        SystemdSocketActivation.DisposeListenerSockets(name);
+                        break;
+                }
+            }
+
+            //listener tasks read _systemdListeners, so start them only after all sockets are added
+            List<(Socket Socket, Func<Socket, DnsTransportProtocol, Task> Handler, DnsTransportProtocol Protocol)> listenerTasks = new List<(Socket, Func<Socket, DnsTransportProtocol, Task>, DnsTransportProtocol)>();
+
+            IReadOnlyList<Socket> do53Sockets = SystemdSocketActivation.GetListenerSockets(SystemdSocketActivation.NAME_DNS);
+
+            foreach (Socket socket in do53Sockets)
+            {
+                try
+                {
+                    switch (socket.SocketType)
+                    {
+                        case SocketType.Dgram:
+                            if (!TryApplyUdpBufferSizes(socket))
+                            {
+                                socket.Dispose();
+                                break;
+                            }
+
+                            IPEndPoint udpLocalEP = socket.LocalEndPoint as IPEndPoint;
+
+                            _systemdListeners.Add(socket);
+                            _systemdDo53UdpEndPoints.Add(udpLocalEP);
+
+                            _log.Write(udpLocalEP, DnsTransportProtocol.Udp, "DNS Server was bound successfully (systemd socket activation).");
+
+                            listenerTasks.Add((socket, ReadUdpRequestAsync, DnsTransportProtocol.Udp));
+                            break;
+
+                        case SocketType.Stream:
+                            IPEndPoint tcpLocalEP = socket.LocalEndPoint as IPEndPoint;
+
+                            _systemdListeners.Add(socket);
+                            _systemdDo53TcpEndPoints.Add(tcpLocalEP);
+
+                            _log.Write(tcpLocalEP, DnsTransportProtocol.Tcp, "DNS Server was bound successfully (systemd socket activation).");
+
+                            listenerTasks.Add((socket, AcceptConnectionAsync, DnsTransportProtocol.Tcp));
+                            break;
+
+                        default:
+                            socket.Dispose();
+                            break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log.Write(ex);
+                }
+            }
+
+            IReadOnlyList<Socket> dotSockets = SystemdSocketActivation.GetListenerSockets(SystemdSocketActivation.NAME_DNS_TLS);
+
+            foreach (Socket socket in dotSockets)
+            {
+                try
+                {
+                    if (socket.SocketType != SocketType.Stream)
+                    {
+                        _log.Write("DNS Server received a systemd activated socket named '" + SystemdSocketActivation.NAME_DNS_TLS + "' that is not a stream socket; the socket was not used.");
+                        socket.Dispose();
+                        continue;
+                    }
+
+                    IPEndPoint tlsLocalEP = socket.LocalEndPoint as IPEndPoint;
+
+                    _systemdListeners.Add(socket);
+                    _systemdDoTEndPoints.Add(tlsLocalEP);
+
+                    _log.Write(tlsLocalEP, DnsTransportProtocol.Tls, "DNS Server was bound successfully (systemd socket activation).");
+
+                    listenerTasks.Add((socket, AcceptConnectionAsync, DnsTransportProtocol.Tls));
+                }
+                catch (Exception ex)
+                {
+                    _log.Write(ex);
+                }
+            }
+
+            int listenerTaskCount = Environment.ProcessorCount;
+
+            foreach ((Socket socket, Func<Socket, DnsTransportProtocol, Task> handler, DnsTransportProtocol protocol) in listenerTasks)
+                StartListenerTasks(socket, listenerTaskCount, handler, protocol);
+        }
+
+        private static bool IsCoveredBySystemdSocket(List<IPEndPoint> systemdEndPoints, IPAddress address, int port)
+        {
+            //a wildcard systemd socket covers every address of its family; a specific one covers only itself
+            foreach (IPEndPoint ep in systemdEndPoints)
+            {
+                if ((ep.Port == port) && (ep.AddressFamily == address.AddressFamily) && (ep.Address.Equals(address) || ep.Address.Equals(IPAddress.Any) || ep.Address.Equals(IPAddress.IPv6Any)))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private bool TryApplyUdpBufferSizes(Socket socket)
+        {
+            try
+            {
+                socket.SendBufferSize = _udpSendBufferSizeKB * 1024;
+                socket.ReceiveBufferSize = _udpReceiveBufferSizeKB * 1024;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _log.Write(ex);
+                return false;
+            }
+        }
+
+        private void StartListenerTasks(Socket socket, int count, Func<Socket, DnsTransportProtocol, Task> handler, DnsTransportProtocol protocol)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                _ = Task.Factory.StartNew(delegate ()
+                {
+                    return handler(socket, protocol);
+                }, CancellationToken.None, TaskCreationOptions.DenyChildAttach, _queryTaskScheduler);
+            }
+        }
+
+        private static bool IsTransientSocketError(SocketError error)
+        {
+            switch (error)
+            {
+                case SocketError.TooManyOpenSockets:
+                case SocketError.NoBufferSpaceAvailable:
+                case SocketError.ConnectionAborted:
+                    return true;
+
+                default:
+                    return false;
+            }
+        }
+
+        private static int GetNextRetryDelay(int retryDelay)
+        {
+            return retryDelay == 0 ? 5 : Math.Min(retryDelay * 2, 1000);
+        }
+
         private async Task ReadUdpRequestAsync(Socket udpListener, DnsTransportProtocol protocol)
         {
             bool sendTruncationResponse;
@@ -1758,16 +1957,18 @@ namespace DnsServerCore.Dns
                 EndPoint epAny;
                 bool enableSocketBindingToSourceEP;
 
+                bool isSystemdListener = _systemdListeners.Contains(udpListener);
+
                 switch (udpListener.AddressFamily)
                 {
                     case AddressFamily.InterNetwork:
                         epAny = new IPEndPoint(IPAddress.Any, 0);
-                        enableSocketBindingToSourceEP = localEP.Address.Equals(IPAddress.Any);
+                        enableSocketBindingToSourceEP = !isSystemdListener && localEP.Address.Equals(IPAddress.Any);
                         break;
 
                     case AddressFamily.InterNetworkV6:
                         epAny = new IPEndPoint(IPAddress.IPv6Any, 0);
-                        enableSocketBindingToSourceEP = localEP.Address.Equals(IPAddress.IPv6Any);
+                        enableSocketBindingToSourceEP = !isSystemdListener && localEP.Address.Equals(IPAddress.IPv6Any);
                         break;
 
                     default:
@@ -1775,6 +1976,7 @@ namespace DnsServerCore.Dns
                 }
 
                 SocketReceiveMessageFromResult result;
+                int retryDelay = 0;
 
                 while (true)
                 {
@@ -1783,6 +1985,7 @@ namespace DnsServerCore.Dns
                     try
                     {
                         result = await udpListener.ReceiveMessageFromAsync(recvBuffer, SocketFlags.None, epAny);
+                        retryDelay = 0;
                     }
                     catch (SocketException ex)
                     {
@@ -1796,6 +1999,16 @@ namespace DnsServerCore.Dns
                                 break;
 
                             default:
+                                //a systemd activated socket cannot be recreated by a restart, so keep reading from it
+                                if (isSystemdListener && IsTransientSocketError(ex.SocketErrorCode))
+                                {
+                                    _log.Write(localEP, protocol, ex);
+
+                                    retryDelay = GetNextRetryDelay(retryDelay);
+                                    await Task.Delay(retryDelay);
+                                    continue;
+                                }
+
                                 throw;
                         }
                     }
@@ -2117,9 +2330,27 @@ namespace DnsServerCore.Dns
                 tcpListener.ReceiveTimeout = _tcpReceiveTimeout;
                 tcpListener.NoDelay = true;
 
+                bool isSystemdListener = _systemdListeners.Contains(tcpListener);
+                int retryDelay = 0;
+
                 while (true)
                 {
-                    Socket socket = await tcpListener.AcceptAsync();
+                    Socket socket;
+
+                    try
+                    {
+                        socket = await tcpListener.AcceptAsync();
+                        retryDelay = 0;
+                    }
+                    catch (SocketException ex) when (isSystemdListener && IsTransientSocketError(ex.SocketErrorCode))
+                    {
+                        //a systemd activated socket cannot be recreated by a restart, so keep accepting on it
+                        _log.Write(localEP, protocol, ex);
+
+                        retryDelay = GetNextRetryDelay(retryDelay);
+                        await Task.Delay(retryDelay);
+                        continue;
+                    }
 
                     _ = ProcessConnectionAsync(socket, protocol);
                 }
@@ -2159,6 +2390,9 @@ namespace DnsServerCore.Dns
                         break;
 
                     case DnsTransportProtocol.Tls:
+                        if (!_enableDnsOverTls || (_dotSslServerAuthenticationOptions is null))
+                            return;
+
                         SslStream tlsStream = new SslStream(new NetworkStream(socket));
                         string serverName = null;
 
@@ -6472,48 +6706,54 @@ namespace DnsServerCore.Dns
 
             _state = ServiceState.Starting;
 
+            //use listening sockets handed over by systemd socket activation, when available
+            SetupSystemdListeners();
+
             //bind on all local end points
             foreach (IPEndPoint localEP in _localEndPoints)
             {
-                Socket udpListener = null;
-
-                try
+                if (!IsCoveredBySystemdSocket(_systemdDo53UdpEndPoints, localEP.Address, localEP.Port))
                 {
-                    udpListener = GetUdpListenerSocket(localEP.AddressFamily);
-
-                    if (localEP is InterfaceEndPoint intEP && intEP.InterfaceName is not null)
-                        SocketBindToDevice(udpListener, intEP, DnsTransportProtocol.Udp);
+                    Socket udpListener = null;
 
                     try
                     {
-                        udpListener.Bind(localEP);
-                    }
-                    catch (SocketException ex1)
-                    {
-                        switch (ex1.ErrorCode)
+                        udpListener = GetUdpListenerSocket(localEP.AddressFamily);
+
+                        if (localEP is InterfaceEndPoint intEP && intEP.InterfaceName is not null)
+                            SocketBindToDevice(udpListener, intEP, DnsTransportProtocol.Udp);
+
+                        try
                         {
-                            case 99: //SocketException (99): Cannot assign requested address
-                                await Task.Delay(10000); //wait for address to be available before retrying
-                                udpListener.Bind(localEP);
-                                break;
-
-                            default:
-                                throw;
+                            udpListener.Bind(localEP);
                         }
+                        catch (SocketException ex1)
+                        {
+                            switch (ex1.ErrorCode)
+                            {
+                                case 99: //SocketException (99): Cannot assign requested address
+                                    await Task.Delay(10000); //wait for address to be available before retrying
+                                    udpListener.Bind(localEP);
+                                    break;
+
+                                default:
+                                    throw;
+                            }
+                        }
+
+                        _udpListeners.Add(udpListener);
+
+                        _log.Write(localEP, DnsTransportProtocol.Udp, "DNS Server was bound successfully.");
                     }
+                    catch (Exception ex)
+                    {
+                        _log.Write(localEP, DnsTransportProtocol.Udp, "DNS Server failed to bind.", ex);
 
-                    _udpListeners.Add(udpListener);
+                        udpListener?.Dispose();
 
-                    _log.Write(localEP, DnsTransportProtocol.Udp, "DNS Server was bound successfully.");
-                }
-                catch (Exception ex)
-                {
-                    _log.Write(localEP, DnsTransportProtocol.Udp, "DNS Server failed to bind.", ex);
-
-                    udpListener?.Dispose();
-
-                    if (throwIfBindFails)
-                        throw;
+                        if (throwIfBindFails)
+                            throw;
+                    }
                 }
 
                 if (_enableDnsOverUdpProxy)
@@ -6545,33 +6785,36 @@ namespace DnsServerCore.Dns
                     }
                 }
 
-                Socket tcpListener = null;
-
-                try
+                if (!IsCoveredBySystemdSocket(_systemdDo53TcpEndPoints, localEP.Address, localEP.Port))
                 {
-                    tcpListener = new Socket(localEP.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+                    Socket tcpListener = null;
 
-                    if (localEP is InterfaceEndPoint intEP && intEP.InterfaceName is not null)
-                        SocketBindToDevice(tcpListener, intEP, DnsTransportProtocol.Tcp);
+                    try
+                    {
+                        tcpListener = new Socket(localEP.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
 
-                    if (Environment.OSVersion.Platform == PlatformID.Unix)
-                        tcpListener.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, 1); //to allow binding to same port with different addresses
+                        if (localEP is InterfaceEndPoint intEP && intEP.InterfaceName is not null)
+                            SocketBindToDevice(tcpListener, intEP, DnsTransportProtocol.Tcp);
 
-                    tcpListener.Bind(localEP);
-                    tcpListener.Listen(_listenBacklog);
+                        if (Environment.OSVersion.Platform == PlatformID.Unix)
+                            tcpListener.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, 1); //to allow binding to same port with different addresses
 
-                    _tcpListeners.Add(tcpListener);
+                        tcpListener.Bind(localEP);
+                        tcpListener.Listen(_listenBacklog);
 
-                    _log.Write(localEP, DnsTransportProtocol.Tcp, "DNS Server was bound successfully.");
-                }
-                catch (Exception ex)
-                {
-                    _log.Write(localEP, DnsTransportProtocol.Tcp, "DNS Server failed to bind.", ex);
+                        _tcpListeners.Add(tcpListener);
 
-                    tcpListener?.Dispose();
+                        _log.Write(localEP, DnsTransportProtocol.Tcp, "DNS Server was bound successfully.");
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Write(localEP, DnsTransportProtocol.Tcp, "DNS Server failed to bind.", ex);
 
-                    if (throwIfBindFails)
-                        throw;
+                        tcpListener?.Dispose();
+
+                        if (throwIfBindFails)
+                            throw;
+                    }
                 }
 
                 if (_enableDnsOverTcpProxy)
@@ -6607,7 +6850,7 @@ namespace DnsServerCore.Dns
                     }
                 }
 
-                if (_enableDnsOverTls && (_dotSslServerAuthenticationOptions is not null))
+                if (!IsCoveredBySystemdSocket(_systemdDoTEndPoints, localEP.Address, _dnsOverTlsPort) && _enableDnsOverTls && (_dotSslServerAuthenticationOptions is not null))
                 {
                     IPEndPoint tlsEP = new IPEndPoint(localEP.Address, _dnsOverTlsPort);
                     Socket tlsListener = null;
@@ -6691,59 +6934,19 @@ namespace DnsServerCore.Dns
             int listenerTaskCount = Environment.ProcessorCount;
 
             foreach (Socket udpListener in _udpListeners)
-            {
-                for (int i = 0; i < listenerTaskCount; i++)
-                {
-                    _ = Task.Factory.StartNew(delegate ()
-                    {
-                        return ReadUdpRequestAsync(udpListener, DnsTransportProtocol.Udp);
-                    }, CancellationToken.None, TaskCreationOptions.DenyChildAttach, _queryTaskScheduler);
-                }
-            }
+                StartListenerTasks(udpListener, listenerTaskCount, ReadUdpRequestAsync, DnsTransportProtocol.Udp);
 
             foreach (Socket udpProxyListener in _udpProxyListeners)
-            {
-                for (int i = 0; i < listenerTaskCount; i++)
-                {
-                    _ = Task.Factory.StartNew(delegate ()
-                    {
-                        return ReadUdpRequestAsync(udpProxyListener, DnsTransportProtocol.UdpProxy);
-                    }, CancellationToken.None, TaskCreationOptions.DenyChildAttach, _queryTaskScheduler);
-                }
-            }
+                StartListenerTasks(udpProxyListener, listenerTaskCount, ReadUdpRequestAsync, DnsTransportProtocol.UdpProxy);
 
             foreach (Socket tcpListener in _tcpListeners)
-            {
-                for (int i = 0; i < listenerTaskCount; i++)
-                {
-                    _ = Task.Factory.StartNew(delegate ()
-                    {
-                        return AcceptConnectionAsync(tcpListener, DnsTransportProtocol.Tcp);
-                    }, CancellationToken.None, TaskCreationOptions.DenyChildAttach, _queryTaskScheduler);
-                }
-            }
+                StartListenerTasks(tcpListener, listenerTaskCount, AcceptConnectionAsync, DnsTransportProtocol.Tcp);
 
             foreach (Socket tcpProxyListener in _tcpProxyListeners)
-            {
-                for (int i = 0; i < listenerTaskCount; i++)
-                {
-                    _ = Task.Factory.StartNew(delegate ()
-                    {
-                        return AcceptConnectionAsync(tcpProxyListener, DnsTransportProtocol.TcpProxy);
-                    }, CancellationToken.None, TaskCreationOptions.DenyChildAttach, _queryTaskScheduler);
-                }
-            }
+                StartListenerTasks(tcpProxyListener, listenerTaskCount, AcceptConnectionAsync, DnsTransportProtocol.TcpProxy);
 
             foreach (Socket tlsListener in _tlsListeners)
-            {
-                for (int i = 0; i < listenerTaskCount; i++)
-                {
-                    _ = Task.Factory.StartNew(delegate ()
-                    {
-                        return AcceptConnectionAsync(tlsListener, DnsTransportProtocol.Tls);
-                    }, CancellationToken.None, TaskCreationOptions.DenyChildAttach, _queryTaskScheduler);
-                }
-            }
+                StartListenerTasks(tlsListener, listenerTaskCount, AcceptConnectionAsync, DnsTransportProtocol.Tls);
 
             foreach (QuicListener quicListener in _quicListeners)
             {
@@ -6861,6 +7064,9 @@ namespace DnsServerCore.Dns
             _tcpProxyListeners.Clear();
             _tlsListeners.Clear();
             _quicListeners.Clear();
+
+            //note: _systemdListeners are intentionally left running; systemd hands over the file
+            //descriptors only once so the sockets and their reader tasks must survive a restart
 
             await StopDoHAsync();
 
