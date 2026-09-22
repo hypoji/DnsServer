@@ -1,0 +1,17 @@
+[Unit]
+Description=Technitium DNS Server Socket (Do53)
+
+# Install as 'dns.socket' next to 'dns.service'; see build.md for setup steps.
+
+[Socket]
+ListenDatagram=0.0.0.0:53
+ListenDatagram=[::]:53
+ListenStream=0.0.0.0:53
+ListenStream=[::]:53
+BindIPv6Only=ipv6-only
+FileDescriptorName=dns
+ReceiveBuffer=2M
+SendBuffer=2M
+
+[Install]
+WantedBy=sockets.target
